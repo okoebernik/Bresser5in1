@@ -41,6 +41,9 @@ Zusaetzlich wird das ESP32 Boardpaket fuer Arduino benoetigt.
 
 ## Installation
 
+Fertige Firmware und eine Schritt-fuer-Schritt-Anleitung fuer die **Erstinstallation** (Komplett-Image,
+WLAN-Einrichtung, erste Schritte) stehen in [INSTALLATION.md](INSTALLATION.md). Die Kurzfassung fuer den Quellcode:
+
 1. Den Ordner `Bresser5in1_Merged` in den Arduino-Sketchbook-Ordner kopieren oder direkt in der Arduino IDE oeffnen.
 2. In der Arduino IDE das Board `Heltec WiFi LoRa 32(V2)` auswaehlen.
 3. Die benoetigten Libraries installieren.
