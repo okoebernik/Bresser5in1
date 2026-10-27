@@ -1,5 +1,7 @@
 # Erstinstallation
 
+*[English version](INSTALLATION.en.md)*
+
 Anleitung, um den Bresser-5-in-1-Empfaenger auf ein **neues oder leeres Heltec WiFi LoRa 32 V2** zu bringen.
 Wenn auf dem Geraet schon eine Version mit OTA laeuft, reicht ein Update ueber die Web-UI (siehe unten).
 

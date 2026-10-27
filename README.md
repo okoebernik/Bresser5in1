@@ -1,15 +1,21 @@
 # Bresser 5-in-1 LoRa/Wetterempfaenger
 
+*[English version](README.en.md)*
+
 Arduino-Sketch fuer ein Heltec WiFi LoRa 32 V2 Board zum Empfangen einer Bresser 5-in-1 Wetterstation. Das Programm liest die Wetterdaten auf der europaeischen Frequenz im 868-MHz-Band ein, zeigt sie auf dem OLED und im Webinterface an und kann die Werte per MQTT veroeffentlichen.
 
 ## Funktionen
 
 - Empfang von Bresser 5-in-1 Wetterdaten ueber `BresserWeatherSensorReceiver`
-- Modernes Web-Dashboard mit Live-Werten
-- Konfigurationsseite fuer MQTT und Sensor-Auswahl
+- Modernes Web-Dashboard mit Live-Werten (Englisch/Deutsch)
+- Seiten fuer Sensor-Auswahl, Netzwerk, MQTT, Konsole und System
 - Auswahl einer bestimmten Sensor-ID, wenn mehrere Wetterstationen in der Umgebung aktiv sind
 - Anzeige erkannter Sensor-IDs im Pulldown-Menue
 - MQTT-Publishing als JSON
+- REST-API fuer andere Geraete, auch ohne MQTT-Server
+- Firmware-Update per Browser (OTA), Neustart-Knopf
+- Serielle Konsole in der Web-UI mit allen empfangenen Funkpaketen
+- Netzwerk-Einstellungen (WLAN, Hostname, feste IP) in der Web-UI
 - OLED-Anzeige direkt am Heltec-Board
 - Berechnung des Taupunkts
 - Regenwerte fuer Gesamt, 1 Stunde, 24 Stunden und 7 Tage
@@ -41,8 +47,8 @@ Zusaetzlich wird das ESP32 Boardpaket fuer Arduino benoetigt.
 
 ## Installation
 
-Fertige Firmware und eine Schritt-fuer-Schritt-Anleitung fuer die **Erstinstallation** (Komplett-Image,
-WLAN-Einrichtung, erste Schritte) stehen in [INSTALLATION.md](INSTALLATION.md). Die Kurzfassung fuer den Quellcode:
+Fertige Firmware (siehe [Releases](https://github.com/okoebernik/Bresser5in1/releases)) und eine Schritt-fuer-Schritt-Anleitung
+fuer die **Erstinstallation** (Komplett-Image, WLAN-Einrichtung, erste Schritte) stehen in [INSTALLATION.md](INSTALLATION.md). Die Kurzfassung fuer den Quellcode:
 
 1. Den Ordner `Bresser5in1_Merged` in den Arduino-Sketchbook-Ordner kopieren oder direkt in der Arduino IDE oeffnen.
 2. In der Arduino IDE das Board `Heltec WiFi LoRa 32(V2)` auswaehlen.
@@ -138,21 +144,24 @@ Das Dashboard zeigt:
 
 ## Sensor-ID-Auswahl
 
-Wenn mehrere Wetterstationen in der Umgebung aktiv sind, koennen im Config-Menue erkannte Sensor-IDs ausgewaehlt werden.
+Wenn mehrere Wetterstationen in der Umgebung aktiv sind, koennen auf der Seite *Sensor* erkannte Sensor-IDs ausgewaehlt werden.
 
 Vorgehen:
 
 1. Filter zunaechst deaktivieren.
 2. Einige Empfangszyklen warten, bis Sensoren erkannt wurden.
-3. In `/config` die gewuenschte Sensor-ID im Pulldown auswaehlen.
+3. Auf der Seite *Sensor* die gewuenschte Sensor-ID im Pulldown auswaehlen.
 4. `Nur ausgewaehlte Sensor-ID verwenden` aktivieren.
 5. Speichern.
+
+Dashboard, OLED und Regenwerte gehoeren immer zu **einem** Sensor: der gespeicherten Sensor-ID, sonst der zuerst
+empfangenen Station. Weitere Stationen werden nur per MQTT veroeffentlicht (ohne Regen-Zeitfenster).
 
 Wichtig: Wenn der Filter aktiv ist, werden fremde Sensoren bereits auf Ebene der Empfaenger-Library blockiert. Dadurch erscheinen neue/fremde Sensoren dann nicht mehr in der Liste. Zum Suchen weiterer Sensoren den Filter kurz deaktivieren.
 
 ## MQTT
 
-MQTT kann in `/config` aktiviert und konfiguriert werden.
+MQTT kann auf der Seite *MQTT* aktiviert und konfiguriert werden. Das Passwort wird nie an den Browser zurueckgegeben (leeres Feld = unveraendert).
 
 Einstellungen:
 
@@ -263,7 +272,9 @@ Die Bresser-Station liefert einen fortlaufenden Gesamt-Regenzaehler. Der Sketch 
 - Regen 24 Stunden
 - Regen 7 Tage
 
-Wenn der Regenzaehler der Station zurueckgesetzt wird, behandelt der Sketch den neuen Wert als aktuellen Basiswert.
+Bei schwachem Funksignal werden einzelne Pakete fehlerhaft dekodiert. Ein Sprung des Gesamtzaehlers um mehr als 5 mm pro
+Paket (oder ein Rueckgang) gilt deshalb erst als echt, wenn das naechste Paket denselben Wert bestaetigt. Wird der Zaehler der
+Station zurueckgesetzt, zaehlt der Regen seit dem Reset weiter. Die Fenster liegen im RAM und beginnen nach einem Neustart bei 0.
 
 ## Taupunkt
 
@@ -282,6 +293,8 @@ Das OLED zeigt kompakt:
 - Regen 1 Stunde und 24 Stunden
 
 ## Serielle Diagnose
+
+Die gleiche Ausgabe steht live auf der Seite *Konsole* der Web-UI (mit Uptime-Zeitstempel je Zeile).
 
 Serielle Schnittstelle:
 
@@ -305,7 +318,8 @@ Nuetzliche Meldungen:
 
 - Pruefen, ob das richtige Boardprofil verwendet wird.
 - Antenne und Empfangsposition pruefen.
-- Sensorfilter in `/config` testweise deaktivieren.
+- Sensorfilter auf der Seite *Sensor* testweise deaktivieren.
+- Auf der Seite *Konsole* RSSI und Meldungen "kein Paket" pruefen (schlechter als etwa -105 dBm ist grenzwertig).
 - Seriellen Monitor auf `WeatherSensor init failed` pruefen.
 
 ### Falsche Station wird angezeigt
@@ -317,7 +331,7 @@ Nuetzliche Meldungen:
 
 ### MQTT verbindet, aber es kommen keine Daten an
 
-- MQTT in `/config` aktiviert?
+- MQTT auf der Seite *MQTT* aktiviert?
 - Host, Port, Benutzername und Passwort pruefen.
 - Base Topic pruefen.
 - Seriellen Monitor auf `MQTT publish failed` pruefen.
@@ -339,8 +353,10 @@ Der Sketch nutzt nicht-blockierendes Polling fuer den Wetterempfang. Falls es tr
 
 ## Projektdateien
 
-- `Bresser5in1_Merged.ino` - Arduino-Sketch
-- `README.md` - diese Dokumentation
+- `Bresser5in1_Merged/Bresser5in1_Merged.ino` - Arduino-Sketch
+- `Bresser5in1_Merged/web_ui.h` - Web-UI (HTML/CSS/JS, eingebettet)
+- `README.md` / `README.en.md` - diese Dokumentation (Deutsch/Englisch)
+- `INSTALLATION.md` / `INSTALLATION.en.md` - Erstinstallation (Deutsch/Englisch)
 
 ## Hinweise
 
