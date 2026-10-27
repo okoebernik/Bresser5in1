@@ -23,11 +23,57 @@
 #include <WebServer.h>
 #include <SSD1306Wire.h>
 #include <math.h>
+#include <Update.h>
+#include <ArduinoOTA.h>
+#include "web_ui.h"
 
 #ifndef MAX_SENSORS_DEFAULT
 #define MAX_SENSORS_DEFAULT 5
 #endif
 #include <WeatherSensor.h>
+
+// Schreibt auf die serielle Schnittstelle und haelt die letzten Zeilen in einem Ringpuffer,
+// den die Web-Konsole (/api/log) ausliest. Jede Zeile bekommt die Uptime als Praefix.
+class LogPrint : public Print {
+ public:
+  static const size_t SIZE = 6144;
+  size_t write(uint8_t c) override {
+    if (atLineStart_ && c != '\n' && c != '\r') {
+      atLineStart_ = false;
+      char stamp[16];
+      int n = snprintf(stamp, sizeof(stamp), "[%lus] ", (unsigned long)(millis() / 1000));
+      for (int i = 0; i < n; i++) put(stamp[i]);
+    }
+    if (c == '\n') atLineStart_ = true;
+    put(c);
+    return 1;
+  }
+  size_t write(const uint8_t *buf, size_t len) override {
+    for (size_t i = 0; i < len; i++) write(buf[i]);
+    return len;
+  }
+  uint32_t total() const { return total_; }
+  // Kopiert alles ab Position `since` (aelteres wurde ggf. schon ueberschrieben) und setzt `next`.
+  String read(uint32_t since, uint32_t &next) const {
+    if (since > total_) since = 0;
+    if (total_ - since > SIZE) since = total_ - SIZE;
+    String out;
+    out.reserve(total_ - since);
+    for (uint32_t p = since; p < total_; p++) out += buf_[p % SIZE];
+    next = total_;
+    return out;
+  }
+ private:
+  void put(uint8_t c) {
+    Serial.write(c);
+    buf_[total_ % SIZE] = (char)c;
+    total_++;
+  }
+  char buf_[SIZE];
+  uint32_t total_ = 0;
+  bool atLineStart_ = true;
+};
+LogPrint Log;
 
 Preferences prefs;
 WebServer server(80);
@@ -47,10 +93,32 @@ struct AppCfg {
   char mqttUser[32]  = "";
   char mqttPass[32]  = "";
   char baseTopic[64] = "bresser";
+  char otaPass[32]   = "bresser";
+  char hostname[32]  = "BresserHeltec";
+  bool staticIp = false;
+  char netIp[16]   = "";
+  char netGw[16]   = "";
+  char netMask[16] = "255.255.255.0";
+  char netDns[16]  = "";
 } cfg;
+
+// Netzwerk-Aenderungen werden erst nach der HTTP-Antwort angewendet (WLAN-Wechsel
+// wuerde sonst die laufende Verbindung zum Browser kappen).
+bool netPending = false;
+unsigned long netApplyAt = 0;
+String netNewSsid;
+String netNewPass;
+
+const char *OTA_USER = "admin";
+const char *FW_BUILD = __DATE__ " " __TIME__;
+bool otaAuthFailed = false;
+bool otaFinished = false;
 
 WeatherSensor::Sensor lastData{};
 bool hasData = false;
+unsigned long lastPacketMs = 0;
+uint32_t activeSensorId = 0;
+const unsigned long ACTIVE_SENSOR_TIMEOUT_MS = 30UL * 60UL * 1000UL;
 unsigned long lastUpdate = 0;
 unsigned long lastMqttAttempt = 0;
 unsigned long lastWeatherPoll = 0;
@@ -81,6 +149,16 @@ uint16_t rainHistoryHead = 0;
 bool rainHistoryFilled = false;
 unsigned long lastRainHistoryStore = 0;
 float lastRainHistoryValue = NAN;
+
+// Plausibilitaet des Regen-Gesamtzaehlers: Bei schwachem Funksignal werden einzelne Pakete
+// fehlerhaft dekodiert. Ein Sprung groesser als RAIN_MAX_STEP_MM pro Paket (oder ein Rueckgang)
+// gilt nur dann als echt, wenn ihn das naechste Paket bestaetigt.
+const float RAIN_MAX_STEP_MM = 5.0f;
+const float RAIN_CONFIRM_TOLERANCE_MM = 0.05f;
+float rainAccepted = 0.0f;
+bool rainAcceptedValid = false;
+float rainCandidate = 0.0f;
+bool rainCandidateValid = false;
 
 static inline float getWindAvgMS(const WeatherSensor::Sensor &d) {
 #ifdef WIND_DATA_FLOATINGPOINT
@@ -143,8 +221,53 @@ void updateRainHistory(float rainMm) {
   lastRainHistoryValue = rainMm;
 }
 
+void clearRainHistory() {
+  memset(rainHistory, 0, sizeof(rainHistory));
+  rainHistoryHead = 0;
+  rainHistoryFilled = false;
+  lastRainHistoryStore = 0;
+  lastRainHistoryValue = NAN;
+}
+
+// Prueft den neuen Zaehlerstand. Liefert true, wenn er uebernommen wurde (rainAccepted ist dann aktuell).
+bool acceptRain(float v) {
+  bool plausible = rainAcceptedValid && v >= rainAccepted && (v - rainAccepted) <= RAIN_MAX_STEP_MM;
+  if (plausible) {
+    rainAccepted = v;
+    rainCandidateValid = false;
+    return true;
+  }
+
+  bool confirmed = rainCandidateValid && fabsf(v - rainCandidate) <= RAIN_CONFIRM_TOLERANCE_MM;
+  if (!confirmed) {
+    if (rainAcceptedValid) {
+      Log.printf("Regen: unplausibler Zaehlerstand %.1f mm (zuletzt %.1f mm), warte auf Bestaetigung\n", v, rainAccepted);
+    }
+    rainCandidate = v;
+    rainCandidateValid = true;
+    return false;
+  }
+
+  // Bestaetigt: neuer Zaehlerstand ist echt (Erststart, Station neu gestartet oder Empfangsluecke)
+  rainCandidateValid = false;
+  if (rainAcceptedValid) {
+    Log.printf("Regen: Zaehlerstand %.1f mm bestaetigt (vorher %.1f mm), Regenfenster neu gestartet\n", v, rainAccepted);
+  }
+  bool counterReset = rainAcceptedValid && v < rainAccepted;
+  clearRainHistory();
+  if (counterReset) updateRainHistory(0.0f);  // seit dem Reset gefallener Regen zaehlt weiter
+  rainAccepted = v;
+  rainAcceptedValid = true;
+  return true;
+}
+
+// Zaehlerstand fuer Anzeige/MQTT: der geprueften Wert fuer den aktiven Sensor, sonst der Rohwert.
+float rainTotalMm(const WeatherSensor::Sensor &d) {
+  return (rainAcceptedValid && d.sensor_id == activeSensorId) ? rainAccepted : d.w.rain_mm;
+}
+
 float rainDeltaForWindow(unsigned long windowMs) {
-  if (!hasData) return 0.0f;
+  if (!hasData || !rainAcceptedValid) return 0.0f;
 
   uint16_t count = rainHistoryFilled ? RAIN_HISTORY_SLOTS : rainHistoryHead;
   if (count == 0) return 0.0f;
@@ -171,8 +294,8 @@ float rainDeltaForWindow(unsigned long windowMs) {
   int baseSlot = bestSlot >= 0 ? bestSlot : oldestSlot;
   if (baseSlot < 0) return 0.0f;
 
-  float delta = lastData.w.rain_mm - rainHistory[baseSlot].rainMm;
-  if (delta < 0.0f) return lastData.w.rain_mm;
+  float delta = rainAccepted - rainHistory[baseSlot].rainMm;
+  if (delta < 0.0f) return rainAccepted;
   return delta;
 }
 
@@ -201,12 +324,11 @@ bool sensorAllowed(uint32_t id) {
 
 void resetSelectedSensorData() {
   hasData = false;
+  activeSensorId = 0;
   lastData = WeatherSensor::Sensor();
-  memset(rainHistory, 0, sizeof(rainHistory));
-  rainHistoryHead = 0;
-  rainHistoryFilled = false;
-  lastRainHistoryStore = 0;
-  lastRainHistoryValue = NAN;
+  clearRainHistory();
+  rainAcceptedValid = false;
+  rainCandidateValid = false;
 }
 
 void applySensorFilterToReceiver() {
@@ -221,10 +343,10 @@ void applySensorFilterToReceiver() {
       (uint8_t)(cfg.selectedSensorId)
     };
     ws.setSensorsInc(includeList, sizeof(includeList));
-    Serial.printf("Sensor-Filter aktiv: %08lX\n", (unsigned long)cfg.selectedSensorId);
+    Log.printf("Sensor-Filter aktiv: %08lX\n", (unsigned long)cfg.selectedSensorId);
   } else {
     ws.setSensorsInc(emptyList, sizeof(emptyList));
-    Serial.println("Sensor-Filter aus: alle Sensoren erlaubt");
+    Log.println("Sensor-Filter aus: alle Sensoren erlaubt");
   }
 
   ws.clearSlots();
@@ -266,6 +388,13 @@ void loadPrefs() {
   copyToBuffer(cfg.mqttUser, sizeof(cfg.mqttUser), prefs.getString("user", cfg.mqttUser));
   copyToBuffer(cfg.mqttPass, sizeof(cfg.mqttPass), prefs.getString("pass", cfg.mqttPass));
   copyToBuffer(cfg.baseTopic, sizeof(cfg.baseTopic), prefs.getString("topic", cfg.baseTopic));
+  copyToBuffer(cfg.otaPass, sizeof(cfg.otaPass), prefs.getString("otaPass", cfg.otaPass));
+  copyToBuffer(cfg.hostname, sizeof(cfg.hostname), prefs.getString("hostname", cfg.hostname));
+  cfg.staticIp = prefs.getBool("netStatic", cfg.staticIp);
+  copyToBuffer(cfg.netIp, sizeof(cfg.netIp), prefs.getString("netIp", cfg.netIp));
+  copyToBuffer(cfg.netGw, sizeof(cfg.netGw), prefs.getString("netGw", cfg.netGw));
+  copyToBuffer(cfg.netMask, sizeof(cfg.netMask), prefs.getString("netMask", cfg.netMask));
+  copyToBuffer(cfg.netDns, sizeof(cfg.netDns), prefs.getString("netDns", cfg.netDns));
   prefs.end();
 }
 
@@ -279,6 +408,13 @@ void savePrefs() {
   prefs.putString("user", cfg.mqttUser);
   prefs.putString("pass", cfg.mqttPass);
   prefs.putString("topic", cfg.baseTopic);
+  prefs.putString("otaPass", cfg.otaPass);
+  prefs.putString("hostname", cfg.hostname);
+  prefs.putBool("netStatic", cfg.staticIp);
+  prefs.putString("netIp", cfg.netIp);
+  prefs.putString("netGw", cfg.netGw);
+  prefs.putString("netMask", cfg.netMask);
+  prefs.putString("netDns", cfg.netDns);
   prefs.end();
 }
 
@@ -291,7 +427,7 @@ String mqttStatusText() {
 void configureMqttClient() {
   mqtt.setServer(cfg.mqttHost, cfg.mqttPort);
   if (!mqtt.setBufferSize(MQTT_PACKET_BUFFER_SIZE)) {
-    Serial.printf("MQTT buffer resize failed (%u bytes)\n", MQTT_PACKET_BUFFER_SIZE);
+    Log.printf("MQTT buffer resize failed (%u bytes)\n", MQTT_PACKET_BUFFER_SIZE);
   }
 }
 
@@ -308,10 +444,11 @@ void mqttReconnect() {
   } else {
     ok = mqtt.connect(clientId.c_str());
   }
-  Serial.printf("MQTT %s (%s:%u)\n", ok ? "connected" : "failed", cfg.mqttHost, cfg.mqttPort);
+  Log.printf("MQTT %s (%s:%u)\n", ok ? "connected" : "failed", cfg.mqttHost, cfg.mqttPort);
 }
 
-void mqttPublishWeather(const WeatherSensor::Sensor &d) {
+// withRain=false fuer Sensoren ohne eigene Regenhistorie (nicht der aktive Sensor)
+void mqttPublishWeather(const WeatherSensor::Sensor &d, bool withRain) {
   if (!cfg.mqttEnabled || !mqtt.connected()) return;
 
   StaticJsonDocument<896> doc;
@@ -324,10 +461,12 @@ void mqttPublishWeather(const WeatherSensor::Sensor &d) {
   doc["wind_gust_ms"]  = getWindGustMS(d);
   doc["wind_dir_deg"]  = getWindDirDeg(d);
   doc["wind_dir_text"] = windDirText(getWindDirDeg(d));
-  doc["rain_mm"]       = d.w.rain_mm;
-  doc["rain_hour_mm"]  = rainDeltaForWindow(RAIN_HOUR_MS);
-  doc["rain_day_mm"]   = rainDeltaForWindow(RAIN_DAY_MS);
-  doc["rain_week_mm"]  = rainDeltaForWindow(RAIN_WEEK_MS);
+  doc["rain_mm"]       = rainTotalMm(d);
+  if (withRain) {
+    doc["rain_hour_mm"]  = rainDeltaForWindow(RAIN_HOUR_MS);
+    doc["rain_day_mm"]   = rainDeltaForWindow(RAIN_DAY_MS);
+    doc["rain_week_mm"]  = rainDeltaForWindow(RAIN_WEEK_MS);
+  }
   doc["battery_ok"]    = d.battery_ok;
   doc["rssi"]          = d.rssi;
   doc["uptime_s"]      = millis() / 1000;
@@ -335,7 +474,7 @@ void mqttPublishWeather(const WeatherSensor::Sensor &d) {
   char payload[896];
   size_t n = serializeJson(doc, payload, sizeof(payload));
   if (n == 0 || n >= sizeof(payload)) {
-    Serial.printf("MQTT publish skipped: payload too large (%u/%u bytes)\n",
+    Log.printf("MQTT publish skipped: payload too large (%u/%u bytes)\n",
                   (unsigned int)n,
                   (unsigned int)sizeof(payload));
     return;
@@ -345,7 +484,7 @@ void mqttPublishWeather(const WeatherSensor::Sensor &d) {
   snprintf(topic, sizeof(topic), "%s/data/%08lX", cfg.baseTopic, (unsigned long)d.sensor_id);
   bool ok = mqtt.publish(topic, (const uint8_t *)payload, n);
   if (!ok) {
-    Serial.printf("MQTT publish failed: topic=%s payload=%u buffer=%u state=%d\n",
+    Log.printf("MQTT publish failed: topic=%s payload=%u buffer=%u state=%d\n",
                   topic,
                   (unsigned int)n,
                   MQTT_PACKET_BUFFER_SIZE,
@@ -353,163 +492,64 @@ void mqttPublishWeather(const WeatherSensor::Sensor &d) {
   }
 }
 
-const char DASHBOARD_HTML[] PROGMEM = R"HTML(
-<!doctype html>
-<html lang="de">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Bresser Receiver</title>
-<style>
-:root{color-scheme:dark;--bg:#101113;--panel:#191b1f;--panel2:#20242a;--line:#303741;--text:#f2f5f8;--muted:#9aa7b4;--blue:#5aa9ff;--green:#42d392;--amber:#f2b84b;--red:#ff6b6b}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,Segoe UI,Arial,sans-serif}
-header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 22px;border-bottom:1px solid var(--line);background:#15171a}
-h1{font-size:20px;margin:0;font-weight:700;letter-spacing:0}.nav{display:flex;gap:10px;align-items:center}.nav a{color:var(--text);text-decoration:none;border:1px solid var(--line);padding:8px 12px;border-radius:8px;background:var(--panel2)}
-main{max-width:1080px;margin:0 auto;padding:22px}.status{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:16px}.pill{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:10px 12px;color:var(--muted)}.pill b{display:block;color:var(--text);font-size:14px;margin-top:3px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;min-height:112px}.label{color:var(--muted);font-size:12px;text-transform:uppercase}.value{font-size:34px;line-height:1.1;font-weight:750;margin-top:12px}.unit{font-size:15px;color:var(--muted);font-weight:500}.sub{color:var(--muted);margin-top:8px;font-size:14px}
-.temp{border-top:3px solid var(--amber)}.hum{border-top:3px solid var(--blue)}.wind{border-top:3px solid var(--green)}.rain{border-top:3px solid #8ea0ff}.bad{color:var(--red)}.ok{color:var(--green)}
-.wide{grid-column:1/-1;display:grid;grid-template-columns:minmax(180px,1fr) 132px;align-items:center;gap:16px}.windrose{width:124px;height:124px;display:block}.rose-ring{fill:#14171b;stroke:var(--line);stroke-width:1.5}.rose-axis{stroke:#45505c;stroke-width:1}.rose-tick{stroke:#66717f;stroke-width:1.4;stroke-linecap:round}.rose-label{fill:var(--muted);font-size:9px;font-weight:800;text-anchor:middle;dominant-baseline:middle}.rose-label.main{fill:var(--text);font-size:11px}.rose-arrow{fill:var(--red);stroke:#ffd0d0;stroke-width:.7}.rose-center{fill:#f2f5f8;stroke:#14171b;stroke-width:1}.footer{margin-top:16px;color:var(--muted);font-size:13px}
-@media(max-width:560px){header{align-items:flex-start;flex-direction:column}.wide{grid-template-columns:1fr}.value{font-size:30px}}
-</style>
-</head>
-<body>
-<header><h1>Bresser 5-in-1 Receiver</h1><div class="nav"><a href="/">Dashboard</a><a href="/config">Config</a></div></header>
-<main>
-  <section class="status">
-    <div class="pill">Sensor<b id="sensor">--</b></div>
-    <div class="pill">WiFi<b id="wifi">--</b></div>
-    <div class="pill">MQTT<b id="mqtt">--</b></div>
-    <div class="pill">Letztes Update<b id="age">--</b></div>
-  </section>
-  <section class="grid">
-    <div class="card temp"><div class="label">Temperatur</div><div class="value"><span id="temp">--.-</span><span class="unit"> C</span></div></div>
-    <div class="card hum"><div class="label">Luftfeuchte</div><div class="value"><span id="hum">--</span><span class="unit"> %</span></div></div>
-    <div class="card"><div class="label">Taupunkt</div><div class="value"><span id="dew">--.-</span><span class="unit"> C</span></div></div>
-    <div class="card wind"><div class="label">Wind</div><div class="value"><span id="wind">--.-</span><span class="unit"> m/s</span></div><div class="sub" id="windKmh">-- km/h</div></div>
-    <div class="card wind"><div class="label">Boe</div><div class="value"><span id="gust">--.-</span><span class="unit"> m/s</span></div></div>
-    <div class="card rain"><div class="label">Regen gesamt</div><div class="value"><span id="rain">--.-</span><span class="unit"> mm</span></div></div>
-    <div class="card rain"><div class="label">Regen 1h</div><div class="value"><span id="rainHour">--.-</span><span class="unit"> mm</span></div></div>
-    <div class="card rain"><div class="label">Regen 24h</div><div class="value"><span id="rainDay">--.-</span><span class="unit"> mm</span></div></div>
-    <div class="card rain"><div class="label">Regen 7d</div><div class="value"><span id="rainWeek">--.-</span><span class="unit"> mm</span></div></div>
-    <div class="card"><div class="label">Batterie</div><div class="value" id="battery">--</div><div class="sub" id="rssi">RSSI -- dBm</div></div>
-    <div class="card wide"><div><div class="label">Windrichtung</div><div class="value"><span id="dirText">---</span> <span class="unit" id="dirDeg">-- deg</span></div></div><svg class="windrose" viewBox="0 0 104 104" aria-label="Windrose"><circle class="rose-ring" cx="52" cy="52" r="50"/><path class="rose-axis" d="M52 8v88M8 52h88M20.9 20.9l62.2 62.2M83.1 20.9L20.9 83.1"/><path class="rose-tick" d="M52 4v8M52 92v8M4 52h8M92 52h8M18.1 18.1l5.7 5.7M80.2 80.2l5.7 5.7M85.9 18.1l-5.7 5.7M23.8 80.2l-5.7 5.7"/><text class="rose-label main" x="52" y="16">N</text><text class="rose-label main" x="88" y="52">O</text><text class="rose-label main" x="52" y="88">S</text><text class="rose-label main" x="16" y="52">W</text><text class="rose-label" x="76" y="28">NO</text><text class="rose-label" x="76" y="76">SO</text><text class="rose-label" x="28" y="76">SW</text><text class="rose-label" x="28" y="28">NW</text><g id="windArrow" class="rose-arrow"><path d="M52 12l7 38h-4v28l-3 7-3-7V50h-4z"/></g><circle class="rose-center" cx="52" cy="52" r="4"/></svg></div>
-  </section>
-  <div class="footer" id="message">Warte auf Wetterdaten...</div>
-</main>
-<script>
-const f=(n,d=1)=>Number(n||0).toFixed(d);
-async function update(){
-  try{
-    const r=await fetch('/data',{cache:'no-store'});
-    const d=await r.json();
-    document.getElementById('wifi').textContent=d.wifi_connected?d.ip:'offline';
-    document.getElementById('mqtt').textContent=d.mqtt_status;
-    document.getElementById('sensor').textContent=d.valid?d.id_hex.toUpperCase():'--';
-    document.getElementById('age').textContent=d.valid?d.age_s+' s':'--';
-    document.getElementById('message').textContent=d.valid?'Live-Daten aktiv':'Noch keine Daten empfangen';
-    document.getElementById('temp').textContent=d.valid?f(d.temp_c,1):'--.-';
-    document.getElementById('hum').textContent=d.valid?d.humidity:'--';
-    document.getElementById('dew').textContent=d.valid?f(d.dew_point_c,1):'--.-';
-    document.getElementById('wind').textContent=d.valid?f(d.wind_speed_ms,1):'--.-';
-    document.getElementById('gust').textContent=d.valid?f(d.wind_gust_ms,1):'--.-';
-    document.getElementById('rain').textContent=d.valid?f(d.rain_mm,1):'--.-';
-    document.getElementById('rainHour').textContent=d.valid?f(d.rain_hour_mm,1):'--.-';
-    document.getElementById('rainDay').textContent=d.valid?f(d.rain_day_mm,1):'--.-';
-    document.getElementById('rainWeek').textContent=d.valid?f(d.rain_week_mm,1):'--.-';
-    document.getElementById('windKmh').textContent=d.valid?f(d.wind_speed_ms*3.6,1)+' km/h':'-- km/h';
-    document.getElementById('dirText').textContent=d.valid?d.wind_dir_text:'---';
-    document.getElementById('dirDeg').textContent=d.valid?f(d.wind_dir_deg,0)+' deg':'-- deg';
-    document.getElementById('battery').innerHTML=d.valid?(d.battery_ok?'<span class=ok>OK</span>':'<span class=bad>LOW</span>'):'--';
-    document.getElementById('rssi').textContent=d.valid?'RSSI '+f(d.rssi,1)+' dBm':'RSSI -- dBm';
-    document.getElementById('windArrow').setAttribute('transform','rotate('+Number(d.wind_dir_deg||0)+' 52 52)');
-  }catch(e){document.getElementById('message').textContent='Verbindung zum Receiver unterbrochen';}
-}
-setInterval(update,3000);update();
-</script>
-</body>
-</html>
-)HTML";
-
-String checked(bool value) {
-  return value ? " checked" : "";
+void handleIndex() {
+  server.send_P(200, "text/html; charset=utf-8", WEB_HTML);
 }
 
-void handleRoot() {
-  server.send_P(200, "text/html", DASHBOARD_HTML);
+void handleStyle() {
+  server.send_P(200, "text/css; charset=utf-8", WEB_CSS);
 }
 
-void handleConfig() {
-  String html;
-  html.reserve(5200);
-  html += F("<!doctype html><html lang='de'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
-  html += F("<title>Bresser Config</title><style>");
-  html += F("body{margin:0;background:#101113;color:#f2f5f8;font-family:Segoe UI,Arial,sans-serif}");
-  html += F("header{padding:18px 22px;border-bottom:1px solid #303741;background:#15171a;display:flex;justify-content:space-between;gap:12px}");
-  html += F("a{color:#f2f5f8;text-decoration:none}.wrap{max-width:680px;margin:0 auto;padding:22px}");
-  html += F(".panel{background:#191b1f;border:1px solid #303741;border-radius:8px;padding:18px}");
-  html += F("label{display:block;margin:14px 0 6px;color:#9aa7b4;font-size:13px}");
-  html += F("input,select{width:100%;padding:10px;border-radius:8px;border:1px solid #303741;background:#20242a;color:#f2f5f8;font-size:15px}");
-  html += F(".row{display:flex;gap:10px;align-items:center;margin-top:14px}.row input{width:auto}");
-  html += F(".hint{color:#9aa7b4;font-size:13px;line-height:1.4;margin-top:8px}");
-  html += F("button{margin-top:18px;padding:10px 14px;border-radius:8px;border:0;background:#5aa9ff;color:#071018;font-weight:700;cursor:pointer}");
-  html += F("</style></head><body><header><b>Bresser Config</b><a href='/'>Dashboard</a></header><div class='wrap'><form class='panel' method='post' action='/save'>");
-  html += F("<h3>Sensor-Auswahl</h3><div class='row'><input id='sensorFilter' type='checkbox' name='sensorFilter' value='1'");
-  html += checked(cfg.sensorFilterEnabled);
-  html += F("><label for='sensorFilter' style='margin:0'>Nur ausgewaehlte Sensor-ID verwenden</label></div>");
-  html += F("<label>Sensor-ID</label><select id='sensorId' name='sensorId'><option value=''>Alle Sensoren / keine Auswahl</option>");
-  if (cfg.selectedSensorId) {
-    html += F("<option selected value='");
-    html += sensorIdHex(cfg.selectedSensorId);
-    html += F("'>");
-    html += sensorIdHex(cfg.selectedSensorId);
-    html += F(" (gespeichert)</option>");
-  }
-  html += F("</select><div class='hint' id='seenHint'>Erkannte Sensoren werden hier angezeigt, sobald Pakete empfangen wurden.</div>");
-  html += F("<h3>MQTT</h3><div class='row'><input id='enabled' type='checkbox' name='enabled' value='1'");
-  html += checked(cfg.mqttEnabled);
-  html += F("><label for='enabled' style='margin:0'>MQTT aktivieren</label></div>");
-  html += F("<label>MQTT Host</label><input name='host' value='");
-  html += cfg.mqttHost;
-  html += F("'><label>Port</label><input name='port' type='number' min='1' max='65535' value='");
-  html += String(cfg.mqttPort);
-  html += F("'><label>User</label><input name='user' value='");
-  html += cfg.mqttUser;
-  html += F("'><label>Passwort</label><input name='pass' type='password' value='");
-  html += cfg.mqttPass;
-  html += F("'><label>Base Topic</label><input name='topic' value='");
-  html += cfg.baseTopic;
-  html += F("'><button type='submit'>Speichern</button></form></div>");
-  html += F("<script>async function loadSensors(){try{const r=await fetch('/sensors',{cache:'no-store'});const d=await r.json();");
-  html += F("const sel=document.getElementById('sensorId');const hint=document.getElementById('seenHint');const current=sel.value||d.selected_id_hex||'';sel.innerHTML='';");
-  html += F("const all=document.createElement('option');all.value='';all.textContent='Alle Sensoren / keine Auswahl';sel.appendChild(all);let found=!current;");
-  html += F("d.sensors.forEach(s=>{const o=document.createElement('option');o.value=s.id_hex;o.textContent=s.id_hex+'  RSSI '+Number(s.rssi).toFixed(1)+' dBm, vor '+s.age_s+'s';if(s.id_hex==current)found=true;sel.appendChild(o);});");
-  html += F("if(current&&!found){const o=document.createElement('option');o.value=current;o.textContent=current+' (gespeichert, noch nicht wieder gesehen)';sel.appendChild(o);}");
-  html += F("sel.value=current;if(!d.sensors.length){hint.textContent='Noch keine Sensoren erkannt. Empfang abwarten oder Filter kurz deaktivieren, um weitere Stationen zu finden.';return;}");
-  html += F("hint.textContent='Erkannt: '+d.sensors.map(s=>s.id_hex+' ('+s.age_s+'s, '+Number(s.rssi).toFixed(1)+' dBm)').join(', ');");
-  html += F("}catch(e){}}loadSensors();setInterval(loadSensors,5000);</script></body></html>");
-  server.send(200, "text/html", html);
+void handleScript() {
+  server.send_P(200, "application/javascript; charset=utf-8", WEB_JS);
+}
+
+// Das MQTT-Passwort wird nie ausgeliefert; leeres Feld beim Speichern = unveraendert.
+void handleConfigGet() {
+  StaticJsonDocument<384> doc;
+  doc["sensor_filter_enabled"] = cfg.sensorFilterEnabled;
+  doc["selected_sensor_id_hex"] = cfg.selectedSensorId ? sensorIdHex(cfg.selectedSensorId) : String("");
+  doc["mqtt_enabled"] = cfg.mqttEnabled;
+  doc["mqtt_host"] = cfg.mqttHost;
+  doc["mqtt_port"] = cfg.mqttPort;
+  doc["mqtt_user"] = cfg.mqttUser;
+  doc["base_topic"] = cfg.baseTopic;
+  doc["fw_build"] = FW_BUILD;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
 }
 
 void handleSave() {
   bool oldFilterEnabled = cfg.sensorFilterEnabled;
   uint32_t oldSelectedSensorId = cfg.selectedSensorId;
 
+  long port = server.arg("port").toInt();
+  if (server.hasArg("port") && (port < 1 || port > 65535)) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid port\"}");
+    return;
+  }
+
   cfg.mqttEnabled = server.hasArg("enabled");
   cfg.sensorFilterEnabled = server.hasArg("sensorFilter");
   cfg.selectedSensorId = server.hasArg("sensorId") ? parseSensorId(server.arg("sensorId")) : 0;
   if (server.hasArg("host"))  copyToBuffer(cfg.mqttHost, sizeof(cfg.mqttHost), server.arg("host"));
-  if (server.hasArg("port"))  cfg.mqttPort = (uint16_t)server.arg("port").toInt();
+  if (server.hasArg("port"))  cfg.mqttPort = (uint16_t)port;
   if (server.hasArg("user"))  copyToBuffer(cfg.mqttUser, sizeof(cfg.mqttUser), server.arg("user"));
-  if (server.hasArg("pass"))  copyToBuffer(cfg.mqttPass, sizeof(cfg.mqttPass), server.arg("pass"));
+  if (server.arg("pass").length() > 0) copyToBuffer(cfg.mqttPass, sizeof(cfg.mqttPass), server.arg("pass"));
   if (server.hasArg("topic")) copyToBuffer(cfg.baseTopic, sizeof(cfg.baseTopic), server.arg("topic"));
+  if (server.arg("otaPass").length() > 0) {
+    copyToBuffer(cfg.otaPass, sizeof(cfg.otaPass), server.arg("otaPass"));
+    ArduinoOTA.setPassword(cfg.otaPass);
+  }
   savePrefs();
   if (oldFilterEnabled != cfg.sensorFilterEnabled || oldSelectedSensorId != cfg.selectedSensorId) {
     resetSelectedSensorData();
     applySensorFilterToReceiver();
   }
   mqtt.disconnect();
-  server.sendHeader("Location", "/config");
-  server.send(303);
+  server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleData() {
@@ -533,7 +573,7 @@ void handleData() {
     doc["wind_gust_ms"]  = getWindGustMS(lastData);
     doc["wind_dir_deg"]  = getWindDirDeg(lastData);
     doc["wind_dir_text"] = windDirText(getWindDirDeg(lastData));
-    doc["rain_mm"]       = lastData.w.rain_mm;
+    doc["rain_mm"]       = rainTotalMm(lastData);
     doc["rain_hour_mm"]  = rainDeltaForWindow(RAIN_HOUR_MS);
     doc["rain_day_mm"]   = rainDeltaForWindow(RAIN_DAY_MS);
     doc["rain_week_mm"]  = rainDeltaForWindow(RAIN_WEEK_MS);
@@ -586,9 +626,342 @@ void handleSensors() {
   server.send(200, "application/json", out);
 }
 
+bool validHostname(const String &h) {
+  if (h.length() < 1 || h.length() > 31) return false;
+  for (size_t i = 0; i < h.length(); i++) {
+    char c = h[i];
+    if (!(isalnum((unsigned char)c) || c == '-')) return false;
+  }
+  return h[0] != '-' && h[h.length() - 1] != '-';
+}
+
+void handleNetworkGet() {
+  StaticJsonDocument<768> doc;
+  bool up = WiFi.isConnected();
+  doc["connected"] = up;
+  doc["ssid"] = up ? WiFi.SSID() : String("");
+  doc["rssi"] = up ? WiFi.RSSI() : 0;
+  doc["ip"] = up ? WiFi.localIP().toString() : String("");
+  doc["gateway"] = up ? WiFi.gatewayIP().toString() : String("");
+  doc["subnet"] = up ? WiFi.subnetMask().toString() : String("");
+  doc["dns"] = up ? WiFi.dnsIP().toString() : String("");
+  doc["mac"] = WiFi.macAddress();
+  doc["hostname"] = cfg.hostname;
+  doc["dhcp"] = !cfg.staticIp;
+  doc["static_ip"] = cfg.netIp;
+  doc["static_gateway"] = cfg.netGw;
+  doc["static_subnet"] = cfg.netMask;
+  doc["static_dns"] = cfg.netDns;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+// POST startet einen asynchronen Scan, GET liefert das Ergebnis (running=true solange er laeuft).
+void handleScanStart() {
+  WiFi.scanDelete();
+  WiFi.scanNetworks(true);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleScanResult() {
+  int n = WiFi.scanComplete();
+  StaticJsonDocument<1536> doc;
+  doc["running"] = (n == WIFI_SCAN_RUNNING);
+  JsonArray nets = doc["networks"].to<JsonArray>();
+  if (n > 0) {
+    int shown = 0;
+    for (int i = 0; i < n && shown < 12; i++) {
+      String ssid = WiFi.SSID(i);
+      if (ssid.length() == 0) continue;
+      bool dup = false;
+      for (JsonObject o : nets) {
+        if (ssid == o["ssid"].as<String>()) { dup = true; break; }
+      }
+      if (dup) continue;
+      JsonObject item = nets.createNestedObject();
+      item["ssid"] = ssid;
+      item["rssi"] = WiFi.RSSI(i);
+      item["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+      shown++;
+    }
+    WiFi.scanDelete();
+  }
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+void sendJsonError(int code, const char *msg) {
+  server.send(code, "application/json", String("{\"ok\":false,\"error\":\"") + msg + "\"}");
+}
+
+// Aendert WLAN/IP/Hostname. Geschuetzt mit dem Geraete-Passwort (Basic-Auth wie bei OTA),
+// weil eine falsche Einstellung das Geraet vom Netz nehmen kann.
+void handleNetworkSave() {
+  if (!server.authenticate(OTA_USER, cfg.otaPass)) {
+    sendJsonError(401, "unauthorized");
+    return;
+  }
+
+  String hostname = server.arg("hostname");
+  hostname.trim();
+  if (!validHostname(hostname)) {
+    sendJsonError(400, "invalid hostname");
+    return;
+  }
+
+  bool useStatic = !server.hasArg("dhcp");
+  IPAddress ip, gw, mask, dns;
+  if (useStatic) {
+    if (!ip.fromString(server.arg("ip")) || !gw.fromString(server.arg("gateway")) ||
+        !mask.fromString(server.arg("subnet"))) {
+      sendJsonError(400, "invalid ip settings");
+      return;
+    }
+    if (server.arg("dns").length() > 0 && !dns.fromString(server.arg("dns"))) {
+      sendJsonError(400, "invalid dns");
+      return;
+    }
+  }
+
+  String ssid = server.arg("ssid");
+  String pass = server.arg("wifiPass");
+  ssid.trim();
+  bool credsChanged = ssid.length() > 0 && (ssid != WiFi.SSID() || pass.length() > 0);
+  if (ssid.length() > 32 || pass.length() > 63) {
+    sendJsonError(400, "ssid/password too long");
+    return;
+  }
+
+  copyToBuffer(cfg.hostname, sizeof(cfg.hostname), hostname);
+  cfg.staticIp = useStatic;
+  if (useStatic) {
+    copyToBuffer(cfg.netIp, sizeof(cfg.netIp), server.arg("ip"));
+    copyToBuffer(cfg.netGw, sizeof(cfg.netGw), server.arg("gateway"));
+    copyToBuffer(cfg.netMask, sizeof(cfg.netMask), server.arg("subnet"));
+    copyToBuffer(cfg.netDns, sizeof(cfg.netDns), server.arg("dns"));
+  }
+  savePrefs();
+
+  netNewSsid = credsChanged ? ssid : String("");
+  netNewPass = credsChanged ? pass : String("");
+  netPending = true;
+  netApplyAt = millis() + 800;
+  server.send(200, "application/json", "{\"ok\":true,\"restart\":true}");
+}
+
+// Neue Zugangsdaten werden erst getestet (ohne zu speichern). Nur bei Erfolg werden sie
+// dauerhaft uebernommen, sonst bleibt das bisherige WLAN gespeichert. Danach Neustart,
+// damit statische IP und Hostname sauber greifen.
+void applyPendingNetwork() {
+  if (!netPending || (long)(millis() - netApplyAt) < 0) return;
+  netPending = false;
+
+  if (netNewSsid.length() > 0) {
+    Log.printf("WLAN-Wechsel auf '%s' wird getestet\n", netNewSsid.c_str());
+    WiFi.persistent(false);
+    WiFi.disconnect();
+    WiFi.begin(netNewSsid.c_str(), netNewPass.length() ? netNewPass.c_str() : nullptr);
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) delay(250);
+    WiFi.persistent(true);
+    if (WiFi.status() == WL_CONNECTED) {
+      Log.println("Neues WLAN ok, wird gespeichert");
+      WiFi.begin(netNewSsid.c_str(), netNewPass.length() ? netNewPass.c_str() : nullptr);
+      delay(500);
+    } else {
+      Log.println("Neues WLAN fehlgeschlagen, altes bleibt gespeichert");
+    }
+  }
+  Log.println("Netzwerk-Einstellungen uebernommen, Neustart");
+  delay(200);
+  ESP.restart();
+}
+
+// ---------- REST-API fuer andere Geraete (z.B. Multiinstrument) ----------
+// Gleiches Muster wie beim Clinometer: GET /api/<geraet>/values liefert flaches JSON, Einheiten
+// stehen im Feldnamen, "stale" ist true, wenn keine frischen Daten vorliegen. Nur lesend, ohne Login.
+const unsigned long API_STALE_AFTER_S = 120;
+
+void sendApiJson(const JsonDocument &doc) {
+  String out;
+  serializeJson(doc, out);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", out);
+}
+
+void handleApiWeatherValues() {
+  StaticJsonDocument<768> doc;
+  unsigned long ageS = hasData ? (millis() - lastUpdate) / 1000 : 0;
+  bool stale = !hasData || ageS > API_STALE_AFTER_S;
+  doc["valid"] = hasData;
+  doc["stale"] = stale;
+
+  if (hasData) {
+    doc["sensor_id"]       = sensorIdHex(lastData.sensor_id);
+    doc["age_s"]           = ageS;
+    doc["temperature_c"]   = lastData.w.temp_c;
+    doc["humidity_pct"]    = lastData.w.humidity;
+    doc["dew_point_c"]     = calculateDewPointC(lastData.w.temp_c, lastData.w.humidity);
+    doc["wind_speed_ms"]   = getWindAvgMS(lastData);
+    doc["wind_gust_ms"]    = getWindGustMS(lastData);
+    doc["wind_dir_deg"]    = getWindDirDeg(lastData);
+    doc["wind_dir_text"]   = windDirText(getWindDirDeg(lastData));
+    doc["rain_total_mm"]   = rainTotalMm(lastData);
+    doc["rain_1h_mm"]      = rainDeltaForWindow(RAIN_HOUR_MS);
+    doc["rain_24h_mm"]     = rainDeltaForWindow(RAIN_DAY_MS);
+    doc["rain_7d_mm"]      = rainDeltaForWindow(RAIN_WEEK_MS);
+    doc["battery_ok"]      = lastData.battery_ok;
+    doc["rssi_dbm"]        = lastData.rssi;
+  }
+  sendApiJson(doc);
+}
+
+void handleApiStatus() {
+  StaticJsonDocument<512> doc;
+  doc["fw_build"] = FW_BUILD;
+  doc["uptime_s"] = millis() / 1000;
+  doc["free_heap"] = ESP.getFreeHeap();
+  doc["wifi_connected"] = WiFi.isConnected();
+  doc["wifi_rssi_dbm"] = WiFi.isConnected() ? WiFi.RSSI() : 0;
+  doc["ip"] = WiFi.isConnected() ? WiFi.localIP().toString() : String("");
+  doc["mqtt_status"] = mqttStatusText();
+  doc["active_sensor_id"] = activeSensorId ? sensorIdHex(activeSensorId) : String("");
+  doc["last_packet_age_s"] = lastPacketMs ? (long)((millis() - lastPacketMs) / 1000) : -1;
+  sendApiJson(doc);
+}
+
+unsigned long restartAt = 0;
+
+// Geraete-Neustart per Web-UI (Basic-Auth wie bei OTA); der Neustart erfolgt nach der Antwort.
+void handleRestart() {
+  if (!server.authenticate(OTA_USER, cfg.otaPass)) {
+    sendJsonError(401, "unauthorized");
+    return;
+  }
+  Log.println("Neustart per Web-UI angefordert");
+  server.send(200, "application/json", "{\"ok\":true}");
+  restartAt = millis() + 800;
+}
+
+// Liefert neue Log-Zeilen ab Position `since`; die naechste Position steht im Header X-Log-Next.
+void handleLog() {
+  uint32_t next = 0;
+  String text = Log.read((uint32_t)server.arg("since").toInt(), next);
+  server.sendHeader("X-Log-Next", String(next));
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/plain; charset=utf-8", text);
+}
+
+void showOtaProgress(const char *label, unsigned int percent) {
+  if (!display) return;
+  display->clear();
+  display->setTextAlignment(TEXT_ALIGN_LEFT);
+  display->setFont(ArialMT_Plain_10);
+  display->drawString(0, 0, label);
+  display->drawProgressBar(0, 30, 120, 10, percent);
+  display->drawString(0, 46, String(percent) + " %");
+  display->display();
+}
+
+// Firmware-Upload per Browser (multipart, Feld "firmware"), geschuetzt per Basic-Auth.
+void handleOtaFinish() {
+  bool authFailed = otaAuthFailed || !server.authenticate(OTA_USER, cfg.otaPass);
+  bool finished = otaFinished;
+  otaAuthFailed = false;
+  otaFinished = false;
+  if (authFailed) {
+    server.send(401, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
+    return;
+  }
+  bool ok = finished && !Update.hasError();
+  server.send(ok ? 200 : 500, "application/json",
+              ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"update failed\"}");
+  if (ok) {
+    delay(500);
+    ESP.restart();
+  }
+}
+
+void handleOtaUpload() {
+  // Bei nicht-multipart-Requests ruft WebServer diesen Handler als "raw"-Callback
+  // ohne Upload-Objekt auf; server.upload() waere dann ein Null-Zugriff.
+  if (server.header("Content-Type").indexOf("multipart/form-data") < 0) return;
+  HTTPUpload &up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    otaAuthFailed = !server.authenticate(OTA_USER, cfg.otaPass);
+    if (otaAuthFailed) return;
+    Log.printf("OTA (Web) Start: %s\n", up.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Log);
+    showOtaProgress("OTA Update (Web)", 0);
+  } else if (otaAuthFailed) {
+    return;
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Log);
+    // Gesamtgroesse ist beim Multipart-Upload nur ueber Content-Length bekannt (inkl. kleinem Overhead)
+    static unsigned int lastPct = 101;
+    size_t total = server.clientContentLength();
+    unsigned int pct = total ? (unsigned int)min<size_t>(99, (up.totalSize * 100UL) / total) : 0;
+    if (pct != lastPct) {
+      lastPct = pct;
+      showOtaProgress("OTA Update (Web)", pct);
+    }
+  } else if (up.status == UPLOAD_FILE_END) {
+    showOtaProgress("OTA Update (Web)", 100);
+    if (Update.end(true)) {
+      otaFinished = true;
+      Log.printf("OTA (Web) fertig: %u Bytes\n", (unsigned int)up.totalSize);
+    } else {
+      Update.printError(Log);
+    }
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+  }
+}
+
+void setupOta() {
+  ArduinoOTA.setHostname(cfg.hostname);
+  ArduinoOTA.setPassword(cfg.otaPass);
+  ArduinoOTA.onStart([]() {
+    Log.println("OTA Start");
+    showOtaProgress("OTA Update", 0);
+  });
+  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    static unsigned int lastPct = 101;
+    unsigned int pct = total ? (done * 100U) / total : 0;
+    if (pct != lastPct) {
+      lastPct = pct;
+      showOtaProgress("OTA Update", pct);
+    }
+  });
+  ArduinoOTA.onEnd([]() { Log.println("OTA fertig, Neustart"); });
+  ArduinoOTA.onError([](ota_error_t err) { Log.printf("OTA Fehler %u\n", (unsigned int)err); });
+  ArduinoOTA.begin();
+}
+
 void setupWeb() {
-  server.on("/", handleRoot);
-  server.on("/config", handleConfig);
+  const char *headerKeys[] = {"Content-Type"};
+  server.collectHeaders(headerKeys, 1);
+  server.on("/api/system/ota", HTTP_POST, handleOtaFinish, handleOtaUpload);
+  server.on("/", handleIndex);
+  server.on("/style.css", handleStyle);
+  server.on("/app.js", handleScript);
+  server.on("/api/config", HTTP_GET, handleConfigGet);
+  server.on("/api/weather/values", HTTP_GET, handleApiWeatherValues);
+  server.on("/api/status", HTTP_GET, handleApiStatus);
+  server.on("/api/log", HTTP_GET, handleLog);
+  server.on("/api/system/restart", HTTP_POST, handleRestart);
+  server.on("/api/network", HTTP_GET, handleNetworkGet);
+  server.on("/api/network", HTTP_POST, handleNetworkSave);
+  server.on("/api/network/scan", HTTP_POST, handleScanStart);
+  server.on("/api/network/scan", HTTP_GET, handleScanResult);
+  server.on("/config", []() {
+    server.sendHeader("Location", "/#mqtt");
+    server.send(303);
+  });
   server.on("/save", HTTP_POST, handleSave);
   server.on("/data", handleData);
   server.on("/sensors", handleSensors);
@@ -596,14 +969,21 @@ void setupWeb() {
     server.send(404, "text/plain", "Not found");
   });
   server.begin();
-  Serial.println("HTTP web server started");
+  Log.println("HTTP web server started");
 }
 
 void setupWiFi() {
   WiFiManager wm;
   WiFi.mode(WIFI_STA);
-  WiFi.setHostname("BresserHeltec");
+  WiFi.setHostname(cfg.hostname);
   wm.setConfigPortalTimeout(300);
+
+  IPAddress ip, gw, mask, dns;
+  if (cfg.staticIp && ip.fromString(cfg.netIp) && gw.fromString(cfg.netGw) && mask.fromString(cfg.netMask)) {
+    if (!dns.fromString(cfg.netDns)) dns = gw;
+    wm.setSTAStaticIPConfig(ip, gw, mask, dns);
+    Log.printf("Statische IP: %s\n", cfg.netIp);
+  }
 
   pinMode(0, INPUT_PULLUP);
   bool forceAp = (digitalRead(0) == LOW);
@@ -611,19 +991,19 @@ void setupWiFi() {
     wm.startConfigPortal("BresserHeltec");
   }
 
-  Serial.print("Waiting for stable WiFi");
+  Log.print("Waiting for stable WiFi");
   int retries = 0;
   while (WiFi.status() != WL_CONNECTED && retries < 30) {
     delay(500);
-    Serial.print(".");
+    Log.print(".");
     retries++;
   }
-  Serial.println();
+  Log.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+    Log.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
   } else {
-    Serial.println("WiFi not connected");
+    Log.println("WiFi not connected");
   }
 }
 
@@ -656,6 +1036,7 @@ void oledResetAndInit() {
 
   display = new SSD1306Wire(oledAddr, 4, 15);
   display->init();
+  display->flipScreenVertically();
   display->clear();
   display->setTextAlignment(TEXT_ALIGN_LEFT);
   display->setFont(ArialMT_Plain_10);
@@ -673,74 +1054,106 @@ void updateDisplay(const WeatherSensor::Sensor &d) {
   display->drawString(0, 10, "T: " + String(d.w.temp_c, 1) + " C  H: " + String(d.w.humidity) + "%");
   display->drawString(0, 20, "Tau: " + String(calculateDewPointC(d.w.temp_c, d.w.humidity), 1) + " C");
   display->drawString(0, 32, "W: " + String(getWindAvgMS(d), 1) + " m/s");
-  display->drawString(0, 44, "R: " + String(d.w.rain_mm, 1) + " mm");
+  display->drawString(0, 44, "R: " + String(rainTotalMm(d), 1) + " mm");
   display->drawString(0, 54, "1h:" + String(rainDeltaForWindow(RAIN_HOUR_MS), 1) + " 24h:" + String(rainDeltaForWindow(RAIN_DAY_MS), 1));
   display->display();
 }
 
 void setup() {
   Serial.begin(115200);
-  Serial.println();
-  Serial.println("=== Bresser Heltec merged ===");
+  Log.println();
+  Log.println("=== Bresser Heltec merged ===");
 
   loadPrefs();
   oledResetAndInit();
   setupWiFi();
   configureMqttClient();
   setupWeb();
+  setupOta();
 
   int16_t rc = ws.begin();
   if (rc != RADIOLIB_ERR_NONE) {
-    Serial.printf("WeatherSensor init failed (rc=%d)\n", rc);
+    Log.printf("WeatherSensor init failed (rc=%d)\n", rc);
     if (display) {
       display->clear();
       display->drawString(0, 12, "WS init FAIL");
       display->display();
     }
   } else {
-    Serial.println("WeatherSensor init OK");
+    Log.println("WeatherSensor init OK");
     applySensorFilterToReceiver();
     if (display) {
       display->clear();
       display->drawString(0, 12, "WS init OK");
+      display->drawString(0, 26, WiFi.isConnected() ? "IP " + WiFi.localIP().toString() : String("WiFi offline"));
       display->display();
     }
   }
 }
 
 void processWeatherSensor(const WeatherSensor::Sensor &d) {
+  lastPacketMs = millis();
   rememberSeenSensor(d);
   if (!sensorAllowed(d.sensor_id)) {
-    Serial.printf("Sensor %08lX ignoriert (Filter: %08lX)\n",
+    Log.printf("Sensor %08lX ignoriert (Filter: %08lX)\n",
                   (unsigned long)d.sensor_id,
                   (unsigned long)cfg.selectedSensorId);
+    return;
+  }
+
+  // Dashboard, OLED und Regenhistorie gehoeren immer zu genau einem Sensor.
+  // Vorrang hat die gespeicherte Sensor-ID, sonst der zuerst empfangene Sensor.
+  // Verschwindet dieser fuer ACTIVE_SENSOR_TIMEOUT_MS, wird auf den neuen gewechselt.
+  if (cfg.selectedSensorId != 0) {
+    activeSensorId = cfg.selectedSensorId;
+  } else if (activeSensorId == 0) {
+    activeSensorId = d.sensor_id;
+  } else if (d.sensor_id != activeSensorId && hasData &&
+             millis() - lastUpdate >= ACTIVE_SENSOR_TIMEOUT_MS) {
+    resetSelectedSensorData();
+    activeSensorId = d.sensor_id;
+  }
+
+  if (d.sensor_id != activeSensorId) {
+    Log.printf("Sensor %08lX (weitere Station) | Temp: %.1f C | Hum: %u%% | RSSI: %.1f dBm\n",
+               (unsigned long)d.sensor_id, d.w.temp_c, d.w.humidity, d.rssi);
+    mqttPublishWeather(d, false);
     return;
   }
 
   lastData = d;
   hasData = true;
   lastUpdate = millis();
-  updateRainHistory(d.w.rain_mm);
-  mqttPublishWeather(d);
+  if (acceptRain(d.w.rain_mm)) updateRainHistory(rainAccepted);
+  mqttPublishWeather(d, true);
   updateDisplay(d);
 
-  Serial.printf("Sensor %08lX | Temp: %.1f C | Hum: %u%% | Dew: %.1f C | Wind: %.1f m/s | Rain: %.1f mm | 1h: %.1f | 24h: %.1f | 7d: %.1f | Batt: %s\n",
+  Log.printf("Sensor %08lX | Temp: %.1f C | Hum: %u%% | Dew: %.1f C | Wind: %.1f m/s | Rain: %.1f mm | 1h: %.1f | 24h: %.1f | 7d: %.1f | Batt: %s | RSSI: %.1f dBm\n",
                 (unsigned long)d.sensor_id,
                 d.w.temp_c,
                 d.w.humidity,
                 calculateDewPointC(d.w.temp_c, d.w.humidity),
                 getWindAvgMS(d),
-                d.w.rain_mm,
+                rainTotalMm(d),
                 rainDeltaForWindow(RAIN_HOUR_MS),
                 rainDeltaForWindow(RAIN_DAY_MS),
                 rainDeltaForWindow(RAIN_WEEK_MS),
-                d.battery_ok ? "OK" : "LOW");
+                d.battery_ok ? "OK" : "LOW",
+                d.rssi);
 }
 
 void pollWeatherSensor() {
   unsigned long now = millis();
   if (now - lastWeatherPoll < WEATHER_POLL_INTERVAL_MS) return;
   lastWeatherPoll = now;
+
+  // Lebenszeichen fuer die Web-Konsole, solange nichts empfangen wird
+  static unsigned long lastBeat = 0;
+  if (now - lastPacketMs >= 30000UL && now - lastBeat >= 30000UL) {
+    lastBeat = now;
+    Log.printf("Empfang: seit %lu s kein Paket%s\n", (now - lastPacketMs) / 1000UL,
+               cfg.sensorFilterEnabled ? " (Sensorfilter aktiv)" : "");
+  }
 
   if (!cfg.sensorFilterEnabled) {
     ws.clearSlots();
@@ -755,7 +1168,10 @@ void pollWeatherSensor() {
 }
 
 void loop() {
+  ArduinoOTA.handle();
   server.handleClient();
+  applyPendingNetwork();
+  if (restartAt != 0 && (long)(millis() - restartAt) >= 0) ESP.restart();
 
   if (WiFi.isConnected()) {
     mqttReconnect();

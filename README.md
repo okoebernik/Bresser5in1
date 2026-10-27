@@ -61,16 +61,56 @@ Wenn beim Start die Boot-Taste gedrueckt wird, wird das WiFiManager-Portal ebenf
 
 ## Webinterface
 
-Das Webinterface stellt zwei Hauptseiten bereit:
+Das Webinterface ist eine Single-Page-App im Design der uebrigen Geraete (Statusleiste, Sidebar,
+Englisch/Deutsch umschaltbar) mit den Seiten Wetter, Sensor, Netzwerk, MQTT, Konsole und System
+(Firmware-Update per Browser, Geraete-Neustart, OTA-Passwort).
 
-- `/` - Dashboard mit Live-Wetterdaten
-- `/config` - Einstellungen fuer Sensorfilter und MQTT
-
-Weitere Endpunkte:
-
-- `/data` - aktuelle Wetterdaten als JSON
+- `/` - Web-UI
+- `/data` - aktuelle Wetterdaten als JSON (intern fuer die Web-UI)
 - `/sensors` - erkannte Sensor-IDs als JSON
-- `/save` - Speichern der Einstellungen per POST
+- `/save` - Speichern der Sensor-/MQTT-Einstellungen per POST
+
+Aenderungen am Geraet (Netzwerk, Firmware-Update, Neustart, OTA-Passwort) sind per HTTP-Basic-Auth
+geschuetzt: Benutzer `admin`, Passwort = OTA-Passwort (Standard `bresser`, bitte aendern).
+
+## REST-API
+
+Nur lesend, ohne Login, mit `Access-Control-Allow-Origin: *`. Gleiches Muster wie beim Clinometer
+(`GET /api/<geraet>/values`, flaches JSON, Einheit im Feldnamen, `stale`-Flag).
+
+`GET /api/weather/values`
+
+```json
+{
+  "valid": true,
+  "stale": false,
+  "sensor_id": "44125371",
+  "age_s": 8,
+  "temperature_c": 12.4,
+  "humidity_pct": 95,
+  "dew_point_c": 11.6,
+  "wind_speed_ms": 0.0,
+  "wind_gust_ms": 0.0,
+  "wind_dir_deg": 324,
+  "wind_dir_text": "NNW",
+  "rain_total_mm": 113.6,
+  "rain_1h_mm": 0.0,
+  "rain_24h_mm": 0.0,
+  "rain_7d_mm": 0.0,
+  "battery_ok": true,
+  "rssi_dbm": -106.5
+}
+```
+
+- `stale` ist `true`, wenn noch keine Daten vorliegen oder das letzte Paket aelter als 120 s ist.
+- Ohne empfangene Daten enthaelt die Antwort nur `valid: false` und `stale: true`.
+- Die Regenfenster (`rain_1h/24h/7d_mm`) werden im RAM gefuehrt und beginnen nach einem Neustart bei 0.
+
+`GET /api/status` liefert Firmware-Build, Uptime, freien Heap, WLAN/MQTT-Status, aktive Sensor-ID
+und `last_packet_age_s` (-1 = noch kein Paket empfangen).
+
+Weitere Endpunkte: `GET /api/config`, `GET /api/network`, `GET /api/log?since=<pos>` (Konsole,
+Position im Header `X-Log-Next`).
 
 ## Dashboard-Werte
 
