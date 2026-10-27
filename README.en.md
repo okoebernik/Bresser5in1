@@ -45,6 +45,12 @@ Install these libraries in the Arduino IDE:
 
 The ESP32 board package for Arduino is also required.
 
+## Manual
+
+Detailed manual with screenshots of the web interface as PDF:
+[English](docs/Bresser5in1-Manual-en.pdf) | [Deutsch](docs/Bresser5in1-Handbuch-de.pdf)
+(sources are in `docs/manual/`, screenshots in `docs/screenshots/`).
+
 ## Installation
 
 Ready-made firmware (see [Releases](https://github.com/okoebernik/Bresser5in1/releases)) and a step-by-step guide for the
@@ -359,6 +365,7 @@ The sketch uses non-blocking polling for weather reception. If it still feels sl
 - `Bresser5in1_Merged/web_ui.h` - web UI (HTML/CSS/JS, embedded)
 - `README.md` / `README.en.md` - this documentation (German/English)
 - `INSTALLATION.md` / `INSTALLATION.en.md` - first installation (German/English)
+- `docs/` - manual as PDF (German/English), sources (`manual/`), screenshots and the script `tools/make_screenshots.js`
 
 ## Notes
 

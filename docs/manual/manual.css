@@ -1,0 +1,52 @@
+@page { size: A4; margin: 20mm 18mm 22mm 18mm;
+  @bottom-center { content: counter(page); font: 9pt "Segoe UI", Arial, sans-serif; color: #667; } }
+@page :first { margin: 0; @bottom-center { content: none; } }
+
+* { box-sizing: border-box; }
+html { font: 10.5pt/1.5 "Segoe UI", Arial, Helvetica, sans-serif; color: #1c2430; }
+body { margin: 0; counter-reset: chapter; }
+
+/* Titelseite */
+.cover { height: 297mm; padding: 28mm 22mm 20mm; background: #0b121a; color: #e8eef5; page-break-after: always; display: flex; flex-direction: column; }
+.cover__kicker { color: #4da3ff; text-transform: uppercase; letter-spacing: .16em; font-size: 11pt; font-weight: 600; }
+.cover h1 { font-size: 36pt; line-height: 1.12; margin: 6mm 0 6mm; }
+.cover__sub { color: #9fb0c0; font-size: 12pt; max-width: 150mm; margin: 0 0 12mm; }
+.cover__img { width: 100%; border-radius: 3mm; border: 1px solid #253442; box-shadow: 0 4mm 10mm rgba(0,0,0,.45); }
+.cover__meta { margin-top: auto; color: #8a99a8; font-size: 10pt; }
+
+/* Inhaltsverzeichnis */
+.toc { page-break-after: always; }
+.toc ol { padding-left: 1.4em; line-height: 1.9; }
+.toc > ol > li { font-weight: 600; }
+.toc ol ol { font-weight: 400; line-height: 1.6; }
+
+/* Ueberschriften */
+h2 { counter-increment: chapter; counter-reset: section; font-size: 17pt; margin: 9mm 0 3mm; padding-bottom: 1.5mm; border-bottom: 2px solid #4da3ff; color: #0b2a4a; break-after: avoid; }
+h2::before { content: counter(chapter) ". "; }
+h2.noncum { counter-increment: none; }
+h2.noncum::before { content: none; }
+h3 { counter-increment: section; font-size: 12.5pt; margin: 6mm 0 2mm; color: #0b2a4a; break-after: avoid; }
+h2 + h3 { margin-top: 3mm; }
+
+p { margin: 0 0 3mm; orphans: 3; widows: 3; }
+ul, ol { margin: 0 0 3mm; padding-left: 1.4em; }
+li { margin-bottom: 1mm; }
+code, pre { font-family: Consolas, "Cascadia Mono", monospace; font-size: 9pt; }
+code { background: #eef2f6; padding: 0 1.2mm; border-radius: 1mm; }
+pre { background: #0f1822; color: #dce6f0; padding: 3mm 4mm; border-radius: 2mm; white-space: pre-wrap; word-break: break-word; margin: 0 0 4mm; break-inside: avoid; }
+
+table { width: 100%; border-collapse: collapse; margin: 0 0 4mm; font-size: 9.5pt; break-inside: auto; }
+th, td { text-align: left; vertical-align: top; padding: 1.6mm 2.4mm; border: 1px solid #cfd8e1; }
+th { background: #e6edf4; font-weight: 600; }
+tr { break-inside: avoid; }
+td code { white-space: nowrap; }
+
+figure { margin: 3mm 0 5mm; break-inside: avoid; }
+figure img { width: 100%; display: block; border: 1px solid #253442; border-radius: 2mm; }
+figcaption { font-size: 9pt; color: #5a6b7c; margin-top: 1.5mm; text-align: center; }
+
+.note { background: #fff6e0; border-left: 3px solid #e0a030; padding: 2.5mm 3.5mm; margin: 0 0 4mm; font-size: 10pt; break-inside: avoid; }
+.c-green { color: #1f9d6a; font-weight: 600; }
+.c-blue { color: #2a7fd0; font-weight: 600; }
+.c-amber { color: #b97a00; font-weight: 600; }
+.c-red { color: #c0392b; font-weight: 600; }

@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Bresser 5-in-1 Wetterempfänger – Handbuch</title>
+<link rel="stylesheet" href="manual.css">
+</head>
+<body>
+
+<section class="cover">
+  <div class="cover__kicker">Handbuch</div>
+  <h1>Bresser 5-in-1<br>Wetterempfänger</h1>
+  <p class="cover__sub">Empfang, Anzeige und Weitergabe der Messwerte einer Bresser-5-in-1-Wetterstation mit dem Heltec WiFi LoRa 32 V2</p>
+  <img class="cover__img" src="../screenshots/de-dashboard.png" alt="Web-Oberfläche, Seite Wetter">
+  <div class="cover__meta">Firmware-Version 1.0.0 &middot; Deutsch<br>github.com/okoebernik/Bresser5in1</div>
+</section>
+
+<section class="toc">
+  <h2 class="noncum">Inhalt</h2>
+  <ol>
+    <li>Überblick</li>
+    <li>Voraussetzungen</li>
+    <li>Erstinstallation</li>
+    <li>Erste Inbetriebnahme</li>
+    <li>Die Web-Oberfläche
+      <ol>
+        <li>Statusleiste und Sprache</li>
+        <li>Wetter</li>
+        <li>Sensor</li>
+        <li>Netzwerk</li>
+        <li>MQTT</li>
+        <li>Konsole</li>
+        <li>System</li>
+      </ol>
+    </li>
+    <li>OLED-Anzeige</li>
+    <li>Messwerte weitergeben: MQTT und REST-API</li>
+    <li>Empfang verbessern</li>
+    <li>Fehlersuche</li>
+    <li>Sicherheit</li>
+    <li>Technische Daten</li>
+  </ol>
+  <p class="note">Die Bildschirmfotos zeigen Beispieldaten (Adressen und Namen sind Platzhalter) und stammen aus der Web-Oberfläche der Firmware 1.0.0.</p>
+</section>
+
+<h2>Überblick</h2>
+<p>Der Empfänger besteht aus einem <strong>Heltec WiFi LoRa 32 V2</strong>. Sein Funkchip (SX1276) empfängt auf 868 MHz die Telegramme der
+Bresser-5-in-1-Wetterstation. Die Firmware entschlüsselt sie, berechnet daraus weitere Größen (Taupunkt, Regen der letzten
+Stunde, 24 Stunden und 7 Tage) und stellt die Werte auf drei Wegen bereit:</p>
+<ul>
+  <li>auf dem <strong>OLED-Display</strong> am Gerät,</li>
+  <li>in einer <strong>Web-Oberfläche</strong> im WLAN (Live-Werte, Einstellungen, Konsole, Firmware-Update),</li>
+  <li>für andere Geräte per <strong>MQTT</strong> oder per <strong>REST-API</strong> (ohne MQTT-Server).</li>
+</ul>
+<p>Das Gerät ist ein reiner Empfänger. Es sendet nichts an die Wetterstation.</p>
+
+<h2>Voraussetzungen</h2>
+<ul>
+  <li>Heltec WiFi LoRa 32 <strong>V2</strong> (SX1276, 868-MHz-Variante) mit <strong>angeschlossener 868-MHz-Antenne</strong></li>
+  <li>USB-Kabel <strong>mit Datenleitung</strong> und Netzteil (5 V)</li>
+  <li>Bresser 5-in-1 Wetterstation in Funkreichweite</li>
+  <li>WLAN (2,4 GHz); optional ein MQTT-Broker</li>
+  <li>Für die Erstinstallation unter Windows ggf. der USB-Treiber <strong>CP210x</strong></li>
+</ul>
+
+<h2>Erstinstallation</h2>
+<p>Für ein neues oder leeres Board gibt es im Release zwei Dateien:</p>
+<table>
+  <tr><th>Datei</th><th>Zweck</th></tr>
+  <tr><td><code>Bresser5in1-&lt;Version&gt;-erstinstallation.bin</code></td><td>Komplettes Flash-Image (8 MB), wird bei Adresse <code>0x0</code> geschrieben</td></tr>
+  <tr><td><code>Bresser5in1-&lt;Version&gt;.bin</code></td><td>Nur die Firmware, für spätere Updates in der Web-Oberfläche</td></tr>
+</table>
+<h3>Weg A: im Browser (ohne Software)</h3>
+<ol>
+  <li>Gerät per USB anschließen und mit Chrome oder Edge <code>espressif.github.io/esptool-js</code> öffnen.</li>
+  <li>Baudrate <code>921600</code> wählen, <em>Connect</em> klicken und den COM-Port des Geräts auswählen.</li>
+  <li>Als <em>Flash Address</em> <code>0x0</code> eintragen, die Datei <code>…-erstinstallation.bin</code> wählen und <em>Program</em> klicken.</li>
+  <li>Danach das Gerät mit der Taste <strong>RST</strong> neu starten.</li>
+</ol>
+<h3>Weg B: mit esptool</h3>
+<pre>esptool --chip esp32 --port COM5 --baud 921600 write_flash 0x0 Bresser5in1-v1.0.0-erstinstallation.bin</pre>
+<p>Für einen ganz sauberen Start vorher <code>esptool --chip esp32 --port COM5 erase_flash</code> ausführen.</p>
+<h3>Weg C: aus dem Quellcode</h3>
+<p>Arduino IDE mit dem ESP32-Boardpaket (getestet: 3.3.10), Board <em>Heltec WiFi LoRa 32(V2)</em> und den Libraries
+<em>BresserWeatherSensorReceiver</em>, <em>RadioLib</em>, <em>WiFiManager</em>, <em>PubSubClient</em>, <em>ArduinoJson</em> und
+<em>ESP8266 and ESP32 OLED driver for SSD1306 displays</em>. Sketch <code>Bresser5in1_Merged</code> öffnen und hochladen.</p>
+<p class="note"><strong>Achtung:</strong> Das Komplett-Image löscht den Konfigurationsspeicher. WLAN-Zugang, MQTT-Einstellungen und das
+OTA-Passwort müssen danach neu eingerichtet werden. Es ist für Boards mit 8 MB Flash gebaut; bei nur 4 MB bitte Weg C verwenden.
+Die ausführliche Anleitung steht in <code>INSTALLATION.md</code>.</p>
+
+<h2>Erste Inbetriebnahme</h2>
+<ol>
+  <li>Nach dem Flashen startet das Gerät neu. Das OLED zeigt kurz <em>Bresser Receiver</em>, dann <em>WS init OK</em> und die IP-Adresse.</li>
+  <li>Ohne gespeichertes WLAN öffnet das Gerät ein eigenes Netz <strong>BresserHeltec</strong> (ohne Passwort).</li>
+  <li>Mit Handy oder Laptop in dieses Netz wechseln. Das Einrichtungsportal öffnet sich automatisch, sonst <code>http://192.168.4.1</code> aufrufen.</li>
+  <li><em>Configure WiFi</em> wählen, das eigene WLAN auswählen, Passwort eingeben und speichern.</li>
+  <li>Das Gerät verbindet sich und zeigt seine <strong>IP-Adresse auf dem OLED</strong> (und im seriellen Monitor, 115200 Baud).</li>
+  <li>Im Browser <code>http://&lt;IP-Adresse&gt;</code> öffnen, alternativ <code>http://BresserHeltec.local</code>.</li>
+</ol>
+<p>Das Portal bleibt fünf Minuten offen. Wird in dieser Zeit nichts eingerichtet, läuft das Gerät ohne WLAN weiter
+(Empfang und OLED funktionieren). Um das Portal später erneut zu öffnen, beim Einschalten die Taste <strong>PRG</strong> (GPIO0) gedrückt halten.
+Das WLAN lässt sich außerdem jederzeit auf der Seite <em>Netzwerk</em> ändern.</p>
+
+<h2>Die Web-Oberfläche</h2>
+<p>Die Oberfläche ist unter der IP-Adresse des Geräts erreichbar und passt sich der Bildschirmbreite an (am Handy öffnet das
+Menü-Symbol die Seitenleiste). Sie besteht aus einer Statusleiste, einer Seitenleiste zur Navigation und dem Inhaltsbereich.</p>
+
+<h3>Statusleiste und Sprache</h3>
+<p>Die Leiste am oberen Rand zeigt drei Punkte: <strong>WLAN</strong> (verbunden, mit IP-Adresse), <strong>MQTT</strong> (verbunden,
+getrennt oder deaktiviert) und <strong>Sensor</strong> (ID der angezeigten Station). Ein grüner Punkt bedeutet in Ordnung, gelb eine Warnung, grau
+nicht aktiv. Rechts oben wird zwischen <strong>EN</strong> und <strong>DE</strong> umgeschaltet; die Wahl wird im Browser gespeichert.</p>
+
+<h3>Wetter</h3>
+<figure><img src="../screenshots/de-dashboard.png" alt="Seite Wetter"><figcaption>Abbildung 1: Seite <em>Wetter</em> mit allen Live-Werten</figcaption></figure>
+<p>Das Abzeichen oben rechts zeigt <em>Live</em>, solange frische Daten ankommen, sonst das Alter des letzten Pakets oder <em>Noch keine Daten</em>.
+Die Seite aktualisiert sich alle drei Sekunden. Die Station sendet etwa alle zwölf Sekunden neue Werte.</p>
+<table>
+  <tr><th>Karte</th><th>Bedeutung</th></tr>
+  <tr><td>Temperatur, Luftfeuchte</td><td>Gemessene Werte der Station</td></tr>
+  <tr><td>Taupunkt</td><td>Aus Temperatur und Luftfeuchte berechnet</td></tr>
+  <tr><td>Wind, Böe</td><td>Mittlere Windgeschwindigkeit und Böe in m/s; darunter der Wind in km/h</td></tr>
+  <tr><td>Regen gesamt</td><td>Fortlaufender Zähler der Station in mm</td></tr>
+  <tr><td>Regen 1 h / 24 h / 7 d</td><td>Vom Gerät aus dem Zähler berechnet. Beginnt nach einem Neustart bei 0</td></tr>
+  <tr><td>Batterie, RSSI</td><td>Batteriezustand der Station und Signalstärke des letzten Pakets in dBm</td></tr>
+  <tr><td>Windrichtung</td><td>Himmelsrichtung, Grad und Windrose</td></tr>
+</table>
+<p>Der Regen-Gesamtzähler ist gegen Funkfehler abgesichert: Ein Sprung um mehr als 5 mm pro Paket (oder ein Rückgang) wird erst
+übernommen, wenn das nächste Paket denselben Wert bestätigt. Wird der Zähler der Station zurückgesetzt, zählt der Regen seit dem Reset weiter.</p>
+
+<h3>Sensor</h3>
+<figure><img src="../screenshots/de-sensor.png" alt="Seite Sensor"><figcaption>Abbildung 2: Seite <em>Sensor</em> – Auswahl der Wetterstation</figcaption></figure>
+<p>Sind mehrere Bresser-Stationen in Reichweite, lässt sich der Empfang auf eine Station beschränken:</p>
+<ol>
+  <li>Den Filter zunächst ausgeschaltet lassen und einige Minuten warten, bis die eigene Station in der Liste erscheint.</li>
+  <li>Die Sensor-ID im Auswahlfeld wählen. Die Liste zeigt je Station RSSI und Alter des letzten Pakets.</li>
+  <li><em>Nur ausgewählte Sensor-ID verwenden</em> einschalten und <em>Speichern</em> klicken.</li>
+</ol>
+<p>Bei aktivem Filter werden fremde Stationen schon im Empfänger blockiert und erscheinen nicht mehr in der Liste.
+Zum Suchen weiterer Sensoren den Filter kurz ausschalten. Dashboard, OLED und Regenwerte gehören immer zu <strong>einer</strong> Station:
+der gespeicherten Sensor-ID, sonst der zuerst empfangenen. Weitere Stationen werden nur per MQTT veröffentlicht (ohne Regen-Zeitfenster).</p>
+
+<h3>Netzwerk</h3>
+<figure><img src="../screenshots/de-network.png" alt="Seite Netzwerk"><figcaption>Abbildung 3: Seite <em>Netzwerk</em> – Status und Einstellungen</figcaption></figure>
+<p>Oben steht der aktuelle Zustand: SSID, RSSI des WLANs, IP-Adresse, Gateway, Subnetzmaske, DNS, MAC-Adresse und Hostname.
+Darunter lassen sich ändern:</p>
+<ul>
+  <li><strong>WLAN:</strong> <em>Suchen</em> listet Netze in Reichweite nach Signalstärke. Ein Klick übernimmt die SSID. Das Passwort bleibt leer, solange die SSID gleich bleibt;
+  wird die SSID geändert und das Passwort leer gelassen, wird ein offenes Netz angenommen.</li>
+  <li><strong>Hostname:</strong> Buchstaben, Ziffern und Bindestrich, bis 31 Zeichen.</li>
+  <li><strong>IP-Adresse:</strong> automatisch per DHCP oder fest (IP, Gateway, Subnetzmaske, DNS).</li>
+</ul>
+<p>Zum Speichern wird das <strong>Geräte-Passwort</strong> verlangt (Benutzer <code>admin</code>, Passwort = OTA-Passwort). Danach startet das Gerät neu.
+Ein neues WLAN wird vorher getestet und nur bei Erfolg gespeichert; bei falschem Passwort bleibt das bisherige Netz erhalten.
+Bei einem neuen Netz oder einer festen IP ist die Seite danach evtl. nicht mehr unter der alten Adresse erreichbar. Die neue IP steht auf dem OLED.
+Eine feste IP muss zum Netz passen (Adresse, Gateway, Subnetzmaske).</p>
+
+<h3>MQTT</h3>
+<figure><img src="../screenshots/de-mqtt.png" alt="Seite MQTT"><figcaption>Abbildung 4: Seite <em>MQTT</em></figcaption></figure>
+<p>MQTT ist optional und standardmäßig aus. Einzutragen sind Host, Port (Standard 1883), Benutzer, Passwort und <em>Base Topic</em> (Standard <code>bresser</code>).
+Das Passwort wird nie an den Browser zurückgegeben; ein leeres Feld lässt es unverändert. Das Abzeichen zeigt den Verbindungszustand.
+Veröffentlicht wird je Station unter <code>&lt;Base Topic&gt;/data/&lt;Sensor-ID&gt;</code>, siehe Kapitel „Messwerte weitergeben“.</p>
+
+<h3>Konsole</h3>
+<figure><img src="../screenshots/de-console.png" alt="Seite Konsole"><figcaption>Abbildung 5: Seite <em>Konsole</em> mit empfangenen Paketen</figcaption></figure>
+<p>Die Konsole zeigt die serielle Ausgabe des Geräts live an, ohne dass ein Kabel angeschlossen sein muss. Jede Zeile beginnt mit der Uptime in Sekunden.
+Die Meldungen sind deutschsprachig bzw. technisch und werden nicht übersetzt.</p>
+<ul>
+  <li><span class="c-green">Grün:</span> Paket der angezeigten Station mit allen Werten und RSSI</li>
+  <li><span class="c-blue">Blau:</span> Paket einer weiteren Station</li>
+  <li><span class="c-amber">Gelb:</span> Warnungen, etwa „kein Paket“ (alle 30 Sekunden, solange nichts ankommt) oder ein ignorierter Sensor</li>
+  <li><span class="c-red">Rot:</span> Fehler</li>
+</ul>
+<p>Mit <em>Pause</em> hält die Anzeige an, <em>Leeren</em> löscht sie, <em>Kopieren</em> legt den Text in die Zwischenablage. Das Gerät puffert die letzten 6 KB.
+Die Konsole ist das wichtigste Werkzeug, um den Empfang beim Aufstellen zu beurteilen.</p>
+
+<h3>System</h3>
+<figure><img src="../screenshots/de-system.png" alt="Seite System"><figcaption>Abbildung 6: Seite <em>System</em></figcaption></figure>
+<p><strong>Firmware-Update:</strong> Die Datei <code>Bresser5in1-&lt;Version&gt;.bin</code> wählen, das OTA-Passwort eingeben und <em>Hochladen &amp; neu starten</em> klicken.
+Ein Fortschrittsbalken läuft im Browser und auf dem OLED. Danach startet das Gerät selbst neu und behält alle Einstellungen. Das Abzeichen oben zeigt den Build-Zeitstempel
+der laufenden Firmware. Bricht ein Update ab, bleibt die bisherige Firmware aktiv.
+Alternativ lässt sich das Update über die Arduino IDE (Port <em>BresserHeltec</em>) einspielen; eine Firewall kann diesen Weg blockieren.</p>
+<p><strong>Gerät neu starten:</strong> Startet den Empfänger neu (Passwort erforderlich). Die Oberfläche ist danach etwa 15 Sekunden nicht erreichbar.</p>
+<p><strong>OTA-Passwort ändern:</strong> Das Standardpasswort lautet <code>bresser</code> und sollte sofort geändert werden.</p>
+
+<h2>OLED-Anzeige</h2>
+<p>Das Display zeigt kompakt, jeweils für die angezeigte Station: Sensor-ID, Temperatur und Luftfeuchte, Taupunkt, Wind, Regen gesamt sowie
+Regen der letzten Stunde und 24 Stunden. Die Anzeige ist gegenüber der Grundeinstellung des Displays um 180° gedreht. Beim Start steht dort die
+IP-Adresse; bei einem Firmware-Update zeigt es den Fortschritt.</p>
+
+<h2>Messwerte weitergeben: MQTT und REST-API</h2>
+<h3>REST-API (ohne MQTT-Server)</h3>
+<p>Andere Geräte, etwa ein Multiinstrument, können die Werte direkt abfragen. Die API ist nur lesend, braucht keinen Login und sendet
+<code>Access-Control-Allow-Origin: *</code>. Das Muster entspricht dem des Clinometers: <code>GET /api/&lt;gerät&gt;/values</code>, flaches JSON, Einheit im Feldnamen, <code>stale</code>-Flag.</p>
+<pre>GET http://&lt;IP&gt;/api/weather/values
+
+{ "valid": true, "stale": false, "sensor_id": "44125371", "age_s": 8,
+  "temperature_c": 12.4, "humidity_pct": 95, "dew_point_c": 11.6,
+  "wind_speed_ms": 0.0, "wind_gust_ms": 0.0, "wind_dir_deg": 324, "wind_dir_text": "NNW",
+  "rain_total_mm": 113.6, "rain_1h_mm": 0.0, "rain_24h_mm": 0.0, "rain_7d_mm": 0.0,
+  "battery_ok": true, "rssi_dbm": -106.5 }</pre>
+<ul>
+  <li><code>stale</code> ist <code>true</code>, wenn noch keine Daten vorliegen oder das letzte Paket älter als 120 Sekunden ist.</li>
+  <li>Ohne Daten enthält die Antwort nur <code>valid: false</code> und <code>stale: true</code>; Zahlenfelder fehlen dann.</li>
+  <li>Neue Werte kommen etwa alle 12 Sekunden. Ein Abfrageintervall von 10 bis 15 Sekunden genügt.</li>
+</ul>
+<p><code>GET /api/status</code> liefert Firmware-Build, Uptime, freien Speicher, WLAN-Signal, IP, MQTT-Status, aktive Sensor-ID und <code>last_packet_age_s</code> (−1 = noch kein Paket).</p>
+<h3>MQTT</h3>
+<p>Pro empfangenem Paket wird ein JSON unter <code>&lt;Base Topic&gt;/data/&lt;Sensor-ID&gt;</code> veröffentlicht, zum Beispiel <code>bresser/data/44125371</code>:</p>
+<pre>{ "id": 1142051697, "id_hex": "44125371", "temp_c": 12.4, "humidity": 95, "dew_point_c": 11.6,
+  "wind_speed_ms": 0.0, "wind_gust_ms": 0.0, "wind_dir_deg": 324, "wind_dir_text": "NNW",
+  "rain_mm": 113.6, "rain_hour_mm": 0.0, "rain_day_mm": 0.0, "rain_week_mm": 0.0,
+  "battery_ok": true, "rssi": -106.5, "uptime_s": 3600 }</pre>
+<p>Pakete weiterer Stationen enthalten keine Felder <code>rain_hour_mm</code>, <code>rain_day_mm</code> und <code>rain_week_mm</code>.
+Zum Mitlesen: <code>mosquitto_sub -h &lt;Broker&gt; -t 'bresser/#' -v</code>.</p>
+
+<h2>Empfang verbessern</h2>
+<p>Die Signalstärke (RSSI) steht auf der Seite <em>Wetter</em> und in jeder Zeile der <em>Konsole</em>. Je näher der Wert an 0 dBm liegt, desto besser.
+Im Test traten bei etwa −105 dBm bereits fehlerhafte Pakete auf (zum Beispiel ein ständig wechselnder Batteriestatus).
+Das ist ein Erfahrungswert, keine Herstellerangabe; je besser der Wert, desto zuverlässiger der Empfang.</p>
+<ul>
+  <li><strong>Antenne:</strong> Immer eine 868-MHz-Antenne am IPEX-Anschluss verwenden und senkrecht ausrichten wie die der Station.</li>
+  <li><strong>Standort:</strong> So nah wie möglich an die Station, erhöht und mit freier Sicht. Wände, Metall und Fensterfolien dämpfen stark.</li>
+  <li><strong>Störquellen:</strong> Abstand zu Router, Monitoren und billigen USB-Netzteilen halten.</li>
+  <li><strong>Prüfen:</strong> Position in kleinen Schritten ändern und dabei den RSSI in der Konsole beobachten.</li>
+</ul>
+<p>Das Gerät braucht am neuen Standort außerdem ein brauchbares WLAN-Signal. Die WLAN-Signalstärke zeigt die Seite <em>Netzwerk</em>.
+Bei schwachem WLAN kann die Web-Oberfläche langsam reagieren oder abbrechen.</p>
+
+<h2>Fehlersuche</h2>
+<table>
+  <tr><th>Problem</th><th>Lösung</th></tr>
+  <tr><td>Keine Wetterdaten</td><td>Antenne angeschlossen? Näher an die Station? Auf der Seite <em>Sensor</em> den Filter ausschalten und in der <em>Konsole</em> nachsehen, ob irgendein Paket ankommt.</td></tr>
+  <tr><td>Falsche Station wird angezeigt</td><td>Filter ausschalten, warten, die richtige ID wählen, Filter einschalten, speichern.</td></tr>
+  <tr><td>Regenwerte 1 h / 24 h / 7 d stehen auf 0</td><td>Normal nach einem Neustart: Die Fenster füllen sich erst mit der Zeit. Beim Start gilt der erste bestätigte Zählerstand als Basis.</td></tr>
+  <tr><td>Batterie wechselt zwischen OK und LOW</td><td>Meist Dekodierfehler bei schwachem Signal. Empfang verbessern, nicht sofort die Batterie tauschen.</td></tr>
+  <tr><td>Web-Oberfläche nicht erreichbar</td><td>IP vom OLED oder aus dem Router ablesen, gleiches Netz prüfen. Zum erneuten Einrichten des WLANs beim Start <strong>PRG</strong> gedrückt halten.</td></tr>
+  <tr><td>Nach Netzwerk-Änderung nicht erreichbar</td><td>Die neue IP steht auf dem OLED. Bei fester IP Adresse, Gateway und Subnetz prüfen. Im Notfall PRG beim Start halten und das WLAN neu einrichten.</td></tr>
+  <tr><td>MQTT verbindet, aber es kommen keine Daten an</td><td>Host, Port, Benutzer, Passwort und Base Topic prüfen. In der <em>Konsole</em> nach „MQTT publish failed“ suchen. Broker mit <code>mosquitto_sub</code> prüfen.</td></tr>
+  <tr><td>Update schlägt fehl</td><td>OTA-Passwort prüfen (Fehler 401 = falsches Passwort). Es muss die reine Firmware <code>Bresser5in1-&lt;Version&gt;.bin</code> sein, nicht das Komplett-Image.</td></tr>
+  <tr><td>Alles zurück auf Werkszustand</td><td><code>esptool --chip esp32 --port COM5 erase_flash</code>, danach das Komplett-Image neu schreiben.</td></tr>
+</table>
+
+<h2>Sicherheit</h2>
+<ul>
+  <li>Die Web-Oberfläche und die API laufen über <strong>unverschlüsseltes HTTP</strong>. Betreibe das Gerät nur in einem vertrauenswürdigen Heimnetz, nicht direkt im Internet.</li>
+  <li>Die <strong>Lese-Seiten und die REST-API sind ohne Login</strong> erreichbar. Jeder im Netz kann die Wetterwerte abrufen. Die Sensor- und MQTT-Einstellungen lassen sich ebenfalls ohne Passwort ändern.</li>
+  <li>Netzwerk-Änderungen, Firmware-Update, Neustart und das Ändern des OTA-Passworts sind per <strong>HTTP-Basic-Authentifizierung</strong> (Benutzer <code>admin</code>) geschützt.</li>
+  <li>Das Standard-OTA-Passwort <code>bresser</code> ist öffentlich bekannt. <strong>Bitte sofort ändern.</strong></li>
+  <li>Das MQTT-Passwort wird im Gerät gespeichert, aber nie an den Browser zurückgegeben.</li>
+</ul>
+
+<h2>Technische Daten</h2>
+<table>
+  <tr><th>Eigenschaft</th><th>Wert</th></tr>
+  <tr><td>Hardware</td><td>Heltec WiFi LoRa 32 V2 (ESP32, SX1276, 0,96&quot;-OLED)</td></tr>
+  <tr><td>Funk</td><td>868 MHz (Europa), nur Empfang</td></tr>
+  <tr><td>Station</td><td>Bresser 5-in-1 (Temperatur, Luftfeuchte, Wind, Böe, Windrichtung, Regen)</td></tr>
+  <tr><td>Paketintervall der Station</td><td>etwa 12 Sekunden</td></tr>
+  <tr><td>Weboberfläche</td><td>HTTP, Port 80, Deutsch/Englisch</td></tr>
+  <tr><td>Firmware-Update</td><td>Über WLAN (zwei App-Slots), Browser oder Arduino IDE</td></tr>
+  <tr><td>Konfigurationsspeicher</td><td>ESP32-Preferences, bleibt nach Neustart erhalten</td></tr>
+  <tr><td>Serielle Schnittstelle</td><td>115200 Baud</td></tr>
+  <tr><td>Regenfenster</td><td>1 h, 24 h, 7 d (im RAM, nach Neustart leer)</td></tr>
+  <tr><td>Quellcode &amp; Releases</td><td>github.com/okoebernik/Bresser5in1</td></tr>
+</table>
+
+</body>
+</html>

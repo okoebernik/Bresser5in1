@@ -45,6 +45,12 @@ Installiere diese Libraries in der Arduino IDE:
 
 Zusaetzlich wird das ESP32 Boardpaket fuer Arduino benoetigt.
 
+## Handbuch
+
+Ausfuehrliches Handbuch mit Screenshots der Web-Oberflaeche als PDF:
+[Deutsch](docs/Bresser5in1-Handbuch-de.pdf) | [English](docs/Bresser5in1-Manual-en.pdf)
+(die Quellen liegen in `docs/manual/`, die Screenshots in `docs/screenshots/`).
+
 ## Installation
 
 Fertige Firmware (siehe [Releases](https://github.com/okoebernik/Bresser5in1/releases)) und eine Schritt-fuer-Schritt-Anleitung
@@ -357,6 +363,7 @@ Der Sketch nutzt nicht-blockierendes Polling fuer den Wetterempfang. Falls es tr
 - `Bresser5in1_Merged/web_ui.h` - Web-UI (HTML/CSS/JS, eingebettet)
 - `README.md` / `README.en.md` - diese Dokumentation (Deutsch/Englisch)
 - `INSTALLATION.md` / `INSTALLATION.en.md` - Erstinstallation (Deutsch/Englisch)
+- `docs/` - Handbuch als PDF (Deutsch/Englisch), Quellen (`manual/`), Screenshots und das Skript `tools/make_screenshots.js`
 
 ## Hinweise
 
